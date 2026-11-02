@@ -85,6 +85,8 @@ const WKT_TARGETS: Record<string, string> = {
 
 export interface ProtoField {
   readonly name: string;
+  /** Field number (the wire tag). */
+  readonly number: number;
   readonly type: string;
   readonly repeated: boolean;
   readonly optional: boolean;
@@ -157,6 +159,13 @@ export interface ProtoConvertOptions {
   /** Keep only these RPC names. Default: every unary RPC. */
   readonly rpcNames?: ReadonlySet<string>;
   readonly skipStreaming?: boolean;
+  /**
+   * Keep server-streaming RPCs (a unary request, a stream of responses) as
+   * operations whose output collects the stream: `{ items: [response, ...] }`.
+   * Client- and bidi-streaming RPCs are still skipped. Pairs with a protocol
+   * that reads every frame (`@distilled.cloud/core/protocol-grpc`).
+   */
+  readonly collectServerStreams?: boolean;
   readonly skipDeprecated?: boolean;
 }
 
@@ -413,11 +422,12 @@ class Parser {
     }
     const name = this.ident();
     this.expect("=");
-    this.number();
+    const number = this.number();
     const opts = this.parseOptions();
     this.expect(";");
     return {
       name,
+      number,
       type,
       repeated,
       optional,
@@ -1029,7 +1039,9 @@ export const convertProtoToSmithy = (options: ProtoConvertOptions): ProtoConvert
 
   for (const rpc of service.rpcs) {
     if (options.rpcNames && !options.rpcNames.has(rpc.name)) continue;
-    if (rpc.requestStream || rpc.responseStream) {
+    const collect =
+      options.collectServerStreams === true && rpc.responseStream && !rpc.requestStream;
+    if ((rpc.requestStream || rpc.responseStream) && !collect) {
       if (skipStreaming) {
         skippedStreaming++;
         continue;
@@ -1041,7 +1053,22 @@ export const convertProtoToSmithy = (options: ProtoConvertOptions): ProtoConvert
     }
 
     const input = copyIo(ctx, rpc.name, "Request", rpc.requestType);
-    const output = copyIo(ctx, rpc.name, "Response", rpc.responseType);
+    const output = collect
+      ? addShape(bag, `${rpc.name}Stream`, {
+          type: "structure",
+          members: {
+            items: {
+              target: listOf(ctx, emitType(ctx, rpc.responseType, undefined, true)),
+              traits: {
+                "smithy.api#required": {},
+                "smithy.api#documentation":
+                  "Every message of the server stream, in order. The stream ends when the server ends it (bound it with the request's timeout).",
+              },
+            },
+          },
+          traits: { "smithy.api#output": {} },
+        })
+      : copyIo(ctx, rpc.name, "Response", rpc.responseType);
     const httpUri = `/${service.fullName}/${rpc.name}`;
     const traits: Record<string, any> = {
       "smithy.api#http": { method: "POST", uri: httpUri, code: 200 },
@@ -1089,4 +1116,91 @@ export const convertProtoToSmithy = (options: ProtoConvertOptions): ProtoConvert
     skippedDeprecated,
     shapeCount: Object.keys(bag.shapes).length,
   };
+};
+
+// ============================================================================
+// Binary wire descriptors
+// ============================================================================
+
+/** Field kinds of `@distilled.cloud/core/protobuf`. */
+const SCALAR_KINDS = new Set([
+  "double",
+  "float",
+  "int32",
+  "int64",
+  "uint32",
+  "uint64",
+  "sint32",
+  "sint64",
+  "fixed32",
+  "fixed64",
+  "sfixed32",
+  "sfixed64",
+  "bool",
+  "string",
+  "bytes",
+]);
+
+type DescriptorField = [number, string, string, (string | [string, string, string?] | 0)?, 1?];
+
+export interface ProtoDescriptorTable {
+  messages: Record<string, DescriptorField[]>;
+  enums: Record<string, Record<string, number>>;
+  methods: Record<string, [string, string, 1?]>;
+}
+
+/**
+ * The descriptor table `@distilled.cloud/core/protobuf` transcodes with:
+ * every message's fields (number, proto3 JSON name, kind, reference), every
+ * enum's values, and every kept RPC's request/response types by gRPC path.
+ * JSON names match the Smithy members `convertProtoToSmithy` emits.
+ */
+export const protoDescriptors = (
+  files: readonly ProtoFile[],
+  options: { readonly collectServerStreams?: boolean; readonly skipDeprecated?: boolean } = {},
+): ProtoDescriptorTable => {
+  const index = indexFiles(files);
+  const table: ProtoDescriptorTable = { messages: {}, enums: {}, methods: {} };
+  const pkgOf = (fullName: string): string => {
+    for (const file of files) {
+      if (fullName.startsWith(`${file.package}.`)) return file.package;
+    }
+    return "";
+  };
+  const kindOf = (raw: string, pkg: string, scope: string): [string, string | undefined] => {
+    if (SCALAR_KINDS.has(raw)) return [raw, undefined];
+    const resolved = resolveName(raw, pkg, scope, index);
+    if (SCALAR_KINDS.has(resolved)) return [resolved, undefined];
+    if (index.enums.has(resolved)) return ["enum", resolved];
+    return ["message", resolved];
+  };
+  for (const [name, msg] of index.messages) {
+    const pkg = pkgOf(name);
+    table.messages[name] = msg.fields.map((f): DescriptorField => {
+      const json = f.jsonName ?? camel(f.name);
+      if (f.mapKey && f.mapValue) {
+        const [kk] = kindOf(f.mapKey, pkg, name);
+        const [vk, vr] = kindOf(f.mapValue, pkg, name);
+        return [f.number, json, "map", vr ? [kk, vk, vr] : [kk, vk]];
+      }
+      const [kind, ref] = kindOf(f.type, pkg, name);
+      if (f.repeated) return [f.number, json, kind, ref ?? 0, 1];
+      return ref ? [f.number, json, kind, ref] : [f.number, json, kind];
+    });
+  }
+  for (const [name, en] of index.enums) {
+    table.enums[name] = Object.fromEntries(en.values.map((v) => [v.name, v.number]));
+  }
+  for (const service of index.services) {
+    const pkg = service.fullName.split(".").slice(0, -1).join(".");
+    for (const rpc of service.rpcs) {
+      if (rpc.deprecated && (options.skipDeprecated ?? true)) continue;
+      const serverStream = rpc.responseStream && !rpc.requestStream;
+      if (rpc.requestStream || (rpc.responseStream && !options.collectServerStreams)) continue;
+      const req = resolveName(rpc.requestType, pkg, undefined, index);
+      const res = resolveName(rpc.responseType, pkg, undefined, index);
+      table.methods[`/${service.fullName}/${rpc.name}`] = serverStream ? [req, res, 1] : [req, res];
+    }
+  }
+  return table;
 };
