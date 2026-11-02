@@ -16,8 +16,9 @@
  *   A non-zero `grpc-status` becomes a JSON error with the HTTP status
  *   grpc-gateway maps it to (`NOT_FOUND` -> 404, `ALREADY_EXISTS` -> 409,
  *   `UNAUTHENTICATED` -> 401, ...), whose body is
- *   `{ code: "NOT_FOUND", message, grpcStatus: 5 }`. Typed-error patches
- *   match those statuses and messages like any REST error.
+ *   `{ code: 5, status: "NOT_FOUND", message }`. Typed-error patches match
+ *   the numeric gRPC `code` (which tells `FAILED_PRECONDITION` from
+ *   `INVALID_ARGUMENT`, both HTTP 400), the HTTP `status`, or the `message`.
  *
  * Server-streaming methods (flagged in the descriptors) are collected: the
  * response's frames decode to `{ items: [message, ...] }`. Calls must bound
@@ -203,9 +204,9 @@ export const makeGrpcProtocol = <C>(options: GrpcProtocolOptions<C>): Layer.Laye
               return rest.decode({
                 ...args,
                 response: jsonResponse(request, GRPC_HTTP_STATUS[status] ?? 500, base, {
-                  code: GRPC_STATUS_NAMES[status] ?? String(status),
+                  code: status,
                   message: message || GRPC_STATUS_NAMES[status] || `gRPC status ${status}`,
-                  grpcStatus: status,
+                  status: GRPC_STATUS_NAMES[status] ?? String(status),
                 }),
               });
             }
@@ -221,7 +222,8 @@ export const makeGrpcProtocol = <C>(options: GrpcProtocolOptions<C>): Layer.Laye
               return rest.decode({
                 ...args,
                 response: jsonResponse(request, 500, base, {
-                  code: "UNKNOWN",
+                  code: 2,
+                  status: "UNKNOWN",
                   message: "gRPC response carried no message and no grpc-status",
                 }),
               });
